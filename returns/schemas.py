@@ -18,6 +18,15 @@ class CreateReturnIn(BaseModel):
     lines: list[RequestedLineIn] = Field(min_length=1)
 
 
+class LineInspectionIn(BaseModel):
+    line_id: str = Field(min_length=1)
+    condition: ItemCondition
+
+
+class InspectReturnIn(BaseModel):
+    lines: list[LineInspectionIn] = Field(min_length=1)
+
+
 class ReturnLineOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

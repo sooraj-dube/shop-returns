@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from shop_platform.events import RETURNS_STREAM, ItemCondition, ReturnInspected
 
 from returns.app import create_app
 from returns.service import ReturnsService
@@ -19,6 +20,11 @@ def request_return(client, lines=(BOOTS,), *, key=None, order_id="ord_1", custom
         json={"order_id": order_id, "customer_id": customer_id, "lines": list(lines)},
         headers={"Idempotency-Key": key or f"key-{uuid.uuid4().hex}"},
     )
+
+
+def inspect(client, return_id, **conditions):
+    lines = [{"line_id": line_id, "condition": value} for line_id, value in conditions.items()]
+    return client.post(f"/returns/{return_id}/inspect", json={"lines": lines})
 
 
 def error(response):
@@ -83,9 +89,9 @@ def test_repeated_key_replays_the_first_response_without_a_second_return(client,
     assert len(client.get("/orders/ord_1/returns").json()["returns"]) == 1
 
 
-def test_rma_code_already_in_use_is_not_given_out_again(db, orders, clock):
+def test_rma_code_already_in_use_is_not_given_out_again(db, orders, publisher, clock):
     codes = iter(["RMA-AAAAAA", "RMA-AAAAAA", "RMA-BBBBBB"])
-    service = ReturnsService(db, orders, clock, rma_codes=lambda: next(codes))
+    service = ReturnsService(db, orders, publisher, clock, rma_codes=lambda: next(codes))
     with TestClient(create_app(service)) as client:
         first, second = request_return(client), request_return(client)
     assert [first.json()["rma_code"], second.json()["rma_code"]] == ["RMA-AAAAAA", "RMA-BBBBBB"]
@@ -100,3 +106,34 @@ def test_receive_records_the_time_and_is_allowed_once(client, clock):
         response = client.post(f"/returns/{return_id}/{action}")
         assert error(response) == (409, "invalid_return_state")
     assert error(client.post("/returns/ret_missing/receive")) == (404, "return_not_found")
+
+
+def test_inspection_works_out_the_refund_and_publishes_return_inspected(client, publisher):
+    return_id = request_return(client, [BOOTS, SOCKS]).json()["return_id"]
+    client.post(f"/returns/{return_id}/receive")
+    body = inspect(client, return_id, line_boots="opened", line_socks="damaged").json()
+    # Boots came back opened with no fault: 10% restocking fee. Socks are defective: full refund.
+    refunds = [(ln["condition"], ln["refund_cents"], ln["restock"]) for ln in body["lines"]]
+    assert refunds == [("opened", 11_699, True), ("damaged", 2_990, False)]
+    assert (body["status"], body["refund_cents"]) == ("inspected", 14_689)
+    assert client.get(f"/returns/{return_id}").json() == body
+
+    [event] = publisher.events(RETURNS_STREAM)
+    assert isinstance(event, ReturnInspected)
+    assert (event.return_id, event.order_id) == (return_id, "ord_1")
+    assert [(ln.line_id, ln.sku, ln.quantity, ln.condition, ln.restock) for ln in event.lines] == [
+        ("line_boots", "BOOT-42", 1, ItemCondition.OPENED, True),
+        ("line_socks", "SOCK-M", 2, ItemCondition.DAMAGED, False),
+    ]
+
+
+def test_inspection_is_rejected_before_receipt_when_incomplete_and_when_repeated(client, publisher):
+    return_id = request_return(client, [BOOTS, SOCKS]).json()["return_id"]
+    both_new = {"line_boots": "new", "line_socks": "new"}
+    assert error(inspect(client, return_id, **both_new)) == (409, "invalid_return_state")
+    client.post(f"/returns/{return_id}/receive")
+    assert error(inspect(client, return_id, line_boots="new")) == (422, "invalid_inspection")
+    assert publisher.events() == []
+    assert inspect(client, return_id, **both_new).status_code == 200
+    assert error(inspect(client, return_id, **both_new)) == (409, "invalid_return_state")
+    assert len(publisher.events()) == 1

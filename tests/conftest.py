@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 from shop_platform.clock import FixedClock
 from shop_platform.db import Database
+from shop_platform.messaging import InMemoryPublisher
 
 from returns.app import create_app
 from returns.repository import MIGRATIONS_DIR
@@ -22,6 +23,11 @@ def orders():
 
 
 @pytest.fixture
+def publisher():
+    return InMemoryPublisher()
+
+
+@pytest.fixture
 def db():
     db = Database(":memory:")
     db.migrate(MIGRATIONS_DIR)
@@ -30,8 +36,10 @@ def db():
 
 
 @pytest.fixture
-def service(db, orders, clock):
-    return ReturnsService(db, orders, clock, return_window_days=30, restocking_fee_percent=10)
+def service(db, orders, publisher, clock):
+    return ReturnsService(
+        db, orders, publisher, clock, return_window_days=30, restocking_fee_percent=10
+    )
 
 
 @pytest.fixture

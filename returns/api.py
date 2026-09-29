@@ -7,8 +7,8 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from shop_platform.web import ApiError, IdempotencyKey
 
-from returns.domain import ErrorCode, RequestedLine, ReturnsError
-from returns.schemas import CreateReturnIn, ReturnListOut, ReturnOut
+from returns.domain import ErrorCode, LineInspection, RequestedLine, ReturnsError
+from returns.schemas import CreateReturnIn, InspectReturnIn, ReturnListOut, ReturnOut
 from returns.service import ReturnsService
 
 logger = logging.getLogger(__name__)
@@ -80,3 +80,10 @@ def cancel_return(return_id: str, service: Service) -> ReturnOut:
 def receive_return(return_id: str, service: Service) -> ReturnOut:
     with domain_errors():
         return ReturnOut.model_validate(service.receive(return_id))
+
+
+@router.post("/returns/{return_id}/inspect")
+def inspect_return(return_id: str, body: InspectReturnIn, service: Service) -> ReturnOut:
+    inspections = [LineInspection(**line.model_dump()) for line in body.lines]
+    with domain_errors():
+        return ReturnOut.model_validate(service.inspect(return_id, inspections))

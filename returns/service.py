@@ -6,11 +6,20 @@ from typing import Any
 from shop_platform.clients import Order, OrdersClient
 from shop_platform.clock import Clock
 from shop_platform.db import Database
+from shop_platform.events import RETURNS_STREAM, InspectedLine, ReturnInspected
 from shop_platform.http import NotFound, ServiceError, ServiceUnavailable
 from shop_platform.ids import new_id
+from shop_platform.messaging import EventPublisher
 
 from returns import domain
-from returns.domain import ErrorCode, RequestedLine, Return, ReturnsError, ReturnStatus
+from returns.domain import (
+    ErrorCode,
+    LineInspection,
+    RequestedLine,
+    Return,
+    ReturnsError,
+    ReturnStatus,
+)
 from returns.repository import ReturnsRepository, StoredResponse
 from returns.schemas import ReturnOut
 
@@ -25,6 +34,7 @@ class ReturnsService:
         self,
         db: Database,
         orders: OrdersClient,
+        publisher: EventPublisher,
         clock: Clock,
         *,
         return_window_days: int = 30,
@@ -34,6 +44,7 @@ class ReturnsService:
         self._db = db
         self._repo = ReturnsRepository(db)
         self._orders = orders
+        self._publisher = publisher
         self._clock = clock
         self._window_days = return_window_days
         self._fee_percent = restocking_fee_percent
@@ -95,6 +106,26 @@ class ReturnsService:
     def receive(self, return_id: str) -> Return:
         return self._move(return_id, ReturnStatus.RECEIVED, received_at=self._clock.now())
 
+    def inspect(self, return_id: str, inspections: Sequence[LineInspection]) -> Return:
+        """Record each line's condition and refund, then publish ReturnInspected."""
+        with self._db.transaction():
+            ret = self.get_return(return_id)
+            domain.check_transition(ret, ReturnStatus.INSPECTED)
+            lines = domain.apply_inspection(ret.lines, inspections, self._fee_percent)
+            ret = replace(
+                ret,
+                status=ReturnStatus.INSPECTED,
+                lines=lines,
+                refund_cents=sum(line.refund_cents or 0 for line in lines),
+                inspected_at=self._clock.now(),
+            )
+            self._repo.save(ret)
+        logger.info(
+            "return inspected", extra={"return_id": return_id, "refund_cents": ret.refund_cents}
+        )
+        self._publish_inspected(ret)
+        return ret
+
     def _move(self, return_id: str, target: ReturnStatus, **changes: Any) -> Return:
         with self._db.transaction():
             ret = self.get_return(return_id)
@@ -103,6 +134,22 @@ class ReturnsService:
             self._repo.save(ret)
         logger.info("return status changed", extra={"return_id": return_id, "status": target})
         return ret
+
+    def _publish_inspected(self, ret: Return) -> None:
+        event = ReturnInspected(
+            return_id=ret.return_id,
+            order_id=ret.order_id,
+            occurred_at=ret.inspected_at,
+            lines=[InspectedLine.model_validate(line, from_attributes=True) for line in ret.lines],
+        )
+        try:
+            self._publisher.publish(RETURNS_STREAM, event)
+        except Exception:
+            logger.exception(
+                "publishing return.inspected failed",
+                extra={"return_id": ret.return_id, "event_id": event.event_id},
+            )
+            raise
 
     def _fetch_order(self, order_id: str) -> Order:
         try:

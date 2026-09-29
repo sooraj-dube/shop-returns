@@ -3,6 +3,7 @@ from shop_platform.clients import OrdersClient
 from shop_platform.clock import SystemClock
 from shop_platform.db import Database
 from shop_platform.logging import configure_logging
+from shop_platform.messaging import RedisStreamPublisher, redis_from_url
 from shop_platform.web import health_router, install_error_handlers
 
 from returns.api import router
@@ -19,6 +20,7 @@ def build_service(settings: Settings) -> ReturnsService:
     return ReturnsService(
         db,
         OrdersClient(settings.orders_url),
+        RedisStreamPublisher(redis_from_url(settings.redis_url)),
         SystemClock(),
         return_window_days=settings.return_window_days,
         restocking_fee_percent=settings.restocking_fee_percent,
